@@ -7,33 +7,32 @@ HOST = '127.0.0.1'
 PORT = 8080
 
 kms = {"kms totales": 0}
+
 # Función para manejar las conexiones de los clientes
 def handle_client(client_socket, address):
     print(f"Conexión establecida desde {address}")
     
-    while True:
-        # Recibe los datos del cliente
-        data = client_socket.recv(1024)
-        
-        if not data:
-            break
-        
-        # Decodifica los datos y actualiza los kilómetros
-        mensaje = data.decode('utf-8')
-        try:
-            km = int(mensaje)
-            # Puedes realizar aquí cualquier otra comprobación necesaria
-        except ValueError:
-            print(f"Error: el mensaje no es un número: {mensaje}")
-            break
+    # Recibe los datos del cliente
+    data = client_socket.recv(1024)
+    
+    if not data:
+        print("Error: no se recibieron datos")
+        return 
+    
+    # Decodifica los datos y actualiza los kilómetros
+    mensaje = data.decode('utf-8')
+    try:
+        km = int(mensaje)
+    except ValueError:
+        print(f"Error: el mensaje no es un número: {mensaje}")
+        return
 
-        kms["kms totales"] += km
-        print(f"Actualización de kilómetros {kms["kms totales"]} km")
-        # Puedes realizar aquí cualquier otro procesamiento o almacenamiento necesario
-        
-
+    kms["kms totales"] += km
+    print(f"Actualización de kilómetros {kms["kms totales"]} km")
+    
     # Cierra la conexión con el cliente
     client_socket.close()
+
 
 # Configuración del socket del servidor
 server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
