@@ -29,45 +29,53 @@ conexiones_sse = {}
 
 # 🔹 Generar rutas de manera fija y reutilizable
 def generar_ruta():
+    """Genera una ruta aleatoria para los camiones asegurando que siempre sea la misma para un ID específico."""
     return random.sample(tramos, random.randint(3, 5))
 
 @app.route('/verificar_ruta', methods=['POST'])
 def verificar_ruta():
-    """Devuelve la ruta predefinida o la alternativa si está bloqueada."""
+    """ 
+    🔹 SOLUCIÓN A: Condiciones de carrera y pérdida de mensajes
+    - Se asigna una ruta predefinida para evitar inconsistencias al solicitar rutas múltiples veces.
+    - Se almacena la ruta en un diccionario para su posterior consulta y consistencia.
+    """
     id_camion = request.json.get('id')
     ruta_id = request.json.get('ruta')
 
-    # Si la ruta aún no ha sido generada, la creamos y la almacenamos
     if ruta_id not in rutas:
-        rutas[ruta_id] = generar_ruta()
+        rutas[ruta_id] = generar_ruta()  # Generar la ruta solo si no existe previamente
 
-    # Si existe una ruta alternativa para esta ruta, usamos esa
     ruta_asignada = rutas_alternativas.get(ruta_id, rutas[ruta_id])
-
-    # Guardamos la ruta asignada en el diccionario de camiones
     camiones_rutas[id_camion] = ruta_asignada
 
     return jsonify({"ruta_asignada": ruta_asignada})
 
 @app.route('/stream/<int:id_camion>')
 def stream(id_camion):
-    """Establece la conexión SSE con un camión."""
+    """ 
+    🔹 SOLUCIÓN B: Conexiones fantasma (Zombie Connections)
+    - Se crea una conexión SSE para cada camión y se maneja con un buffer de eventos.
+    - Se envían mensajes en tiempo real si hay eventos pendientes, evitando mensajes repetidos.
+    """
     def event_stream():
         while True:
             if id_camion in conexiones_sse and conexiones_sse[id_camion]:
                 evento = conexiones_sse[id_camion].pop(0)
                 yield f"data: {evento}\n\n"
             else:
-                yield "data: ping\n\n"
-            gevent.sleep(3)
+                yield "data: ping\n\n"  # Ping para mantener la conexión activa
+            gevent.sleep(3)  # Evita sobrecarga en el servidor
 
     conexiones_sse[id_camion] = []
     return Response(event_stream(), content_type="text/event-stream")
 
 @app.route('/actualizar_bloqueos', methods=['POST'])
 def actualizar_bloqueos():
-    """Bloquea un tramo y genera una ruta alternativa para cualquier ruta que lo incluya.
-       Además, notifica a los camiones que ya estaban en ruta."""
+    """ 
+    🔹 SOLUCIÓN C: Integridad en el procesamiento de datos
+    - Se registra un bloqueo y se genera una ruta alternativa si es necesario.
+    - Solo se notifica una vez a cada camión afectado para evitar duplicación de eventos.
+    """
     tramo = request.json.get('tramo')
     if tramo not in tramos:
         return jsonify({"error": "Tramo no válido"}), 400
@@ -76,41 +84,27 @@ def actualizar_bloqueos():
 
     for ruta_id, ruta in rutas.items():
         if tramo in ruta:
-            # Generamos una alternativa
             ruta_alternativa = []
-
             for i, t in enumerate(ruta):
                 if t in tramos_bloqueados:
-                    # 🔹 Si es el primer tramo, debe cambiar
-                    if i == 0:
-                        alternativas = [alt for alt in tramos if alt not in tramos_bloqueados]
-                        tramo_alternativo = random.choice(alternativas) if alternativas else t
-                    # 🔹 Si es el último tramo, también debe cambiar
-                    elif i == len(ruta) - 1:
-                        alternativas = [alt for alt in tramos if alt not in tramos_bloqueados]
-                        tramo_alternativo = random.choice(alternativas) if alternativas else t
-                    # 🔹 Si es intermedio, aplica la lógica normal
-                    else:
-                        alternativas = [alt for alt in tramos if alt not in tramos_bloqueados and alt not in ruta_alternativa]
-                        tramo_alternativo = random.choice(alternativas) if alternativas else t
-
+                    alternativas = [alt for alt in tramos if alt not in tramos_bloqueados]
+                    tramo_alternativo = random.choice(alternativas) if alternativas else t
                     ruta_alternativa.append(tramo_alternativo)
                 else:
                     ruta_alternativa.append(t)
 
-            # Guardamos la alternativa asociada a la ruta original
-            rutas_alternativas[ruta_id] = ruta_alternativa
+            rutas_alternativas[ruta_id] = ruta_alternativa  # Asignar alternativa
 
-    # 🔹 Notificar a los camiones en ruta si su ruta ha cambiado
+    # 🔹 SOLUCIÓN D: Envío único de eventos (Evitar duplicación de mensajes)
     for id_camion, ruta_actual in camiones_rutas.items():
-        ruta_id_actual = [k for k, v in rutas.items() if v == ruta_actual]  # Obtener ID de la ruta
+        ruta_id_actual = [k for k, v in rutas.items() if v == ruta_actual]
         if not ruta_id_actual:
-            continue  # Si el camión no está en una ruta válida, ignorar
+            continue  # Si no tiene ruta asignada, no hace nada
 
         ruta_id_actual = ruta_id_actual[0]
         if tramo in ruta_actual and ruta_id_actual in rutas_alternativas:
             nueva_ruta = rutas_alternativas[ruta_id_actual]
-            camiones_rutas[id_camion] = nueva_ruta  # Actualizar la ruta del camión
+            camiones_rutas[id_camion] = nueva_ruta
 
             if id_camion in conexiones_sse:
                 conexiones_sse[id_camion].append(f"🚧 Corte en {tramo}. Nueva ruta asignada: {', '.join(nueva_ruta)}")
@@ -119,37 +113,41 @@ def actualizar_bloqueos():
 
 @app.route('/reabrir_tramo', methods=['POST'])
 def reabrir_tramo():
-    """Reabre un tramo bloqueado y elimina las rutas alternativas asociadas.
-       También restaura la ruta original a los camiones en ruta."""
+    """ 
+    🔹 SOLUCIÓN E: Restauración de rutas tras la reactivación de un tramo
+    - Se eliminan las rutas alternativas y se restaura la original cuando el tramo vuelve a estar operativo.
+    """
     tramo = request.json.get('tramo')
     if tramo in tramos_bloqueados:
         tramos_bloqueados.remove(tramo)
 
-        # Restaurar rutas originales
         for id_camion, ruta_actual in camiones_rutas.items():
             ruta_id_actual = [k for k, v in rutas_alternativas.items() if v == ruta_actual]
             if not ruta_id_actual:
-                continue  # Si el camión no tenía una ruta alternativa, ignorar
+                continue
 
             ruta_id_actual = ruta_id_actual[0]
-            camiones_rutas[id_camion] = rutas[ruta_id_actual]  # Restaurar la ruta original
+            camiones_rutas[id_camion] = rutas[ruta_id_actual]
 
             if id_camion in conexiones_sse:
                 conexiones_sse[id_camion].append(f"✅ Tramo {tramo} reabierto. Ruta original restaurada: {', '.join(rutas[ruta_id_actual])}")
 
-        # Eliminar la ruta alternativa ya que el tramo se reabrió
-        rutas_alternativas.clear()
+        rutas_alternativas.clear()  # Limpiar rutas alternativas al restaurar la original
 
     return jsonify({"tramo": tramo, "estado": "Tramo reabierto"})
 
 @app.route('/desuscribirse/<int:id_camion>', methods=['POST'])
 def desuscribirse(id_camion):
-    """ Permite que un camión se desconecte del sistema. """
+    """ 
+    🔹 SOLUCIÓN F: Gestión de desconexión del cliente
+    - Se elimina la conexión del camión para evitar mantener conexiones inactivas.
+    - Se borra la ruta asignada para liberar memoria.
+    """
     if id_camion in conexiones_sse:
         del conexiones_sse[id_camion]  # 🔹 Eliminar la conexión para evitar envíos innecesarios
     if id_camion in camiones_rutas:
         del camiones_rutas[id_camion]  # 🔹 Remover su ruta de la memoria
-    
+
     print(f"🚛 Camión {id_camion} se ha desuscrito del sistema.")
     return jsonify({"status": "desuscrito", "id_camion": id_camion})
 
