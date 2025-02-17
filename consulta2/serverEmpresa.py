@@ -1,11 +1,11 @@
 import random
-import requests
-from flask import Flask, request, jsonify
+import gevent
+from gevent.pywsgi import WSGIServer
+from flask import Flask, request, jsonify, Response
 
-# CONFIGURACIONES
-HOST_camiones = '127.0.0.1'
-HOST_empresa = '127.0.0.1'
-PORT_empresa = 8765
+# CONFIGURACIÓN
+HOST_EMPRESA = '127.0.0.1'
+PORT_EMPRESA = 8765
 
 app = Flask(__name__)
 
@@ -14,98 +14,105 @@ tramos = [f"TRAMO{str(i).zfill(3)}" for i in range(1, 101)]
 # 50 rutas, cada una con entre 3 a 5 tramos aleatorios
 rutas = {i: random.sample(tramos, random.randint(3, 5)) for i in range(1, 51)}
 
-tramos_bloqueados = []       # Lista de tramos bloqueados
-camiones_en_tramos = {}      # Diccionario: key = tramo, value = lista de id de camiones
-camiones_rutas = {}          # Diccionario: key = id_camion, value = ruta actual (número de ruta)
+tramos_bloqueados = set()  # Tramos bloqueados
+camiones_rutas = {}        # Diccionario: {id_camion: [tramos de su ruta]}
+rutas_originales = {}      # Diccionario: {ruta_id: copia de la ruta original antes de ser modificada}
+conexiones_sse = {}        # Diccionario: {id_camion: eventos SSE pendientes}
+
+
+def calcular_ruta_alternativa(ruta_original):
+    """Genera una ruta alternativa evitando los tramos bloqueados."""
+    ruta_alternativa = []
+    for tramo in ruta_original:
+        if tramo in tramos_bloqueados:
+            alternativas = [t for t in tramos if t not in tramos_bloqueados and t not in ruta_alternativa]
+            tramo_alternativo = random.choice(alternativas) if alternativas else None
+            if tramo_alternativo:
+                ruta_alternativa.append(tramo_alternativo)
+            else:
+                return None  # No hay ruta alternativa disponible
+        else:
+            ruta_alternativa.append(tramo)
+    return ruta_alternativa
+
 
 @app.route('/verificar_ruta', methods=['POST'])
 def verificar_ruta():
+    """Devuelve la ruta actualizada del camión, asegurándose de que no tenga tramos bloqueados."""
     id_camion = request.json.get('id')
-    ruta_id = request.json.get('ruta')  # Se espera un número de ruta (1-50 o un id de ruta alternativa)
-    
-    # Primero, eliminar al camión de todos los tramos en los que esté registrado
-    for tramo, camiones_list in camiones_en_tramos.items():
-        if id_camion in camiones_list:
-            camiones_list.remove(id_camion)
-    
-    # Obtener la ruta original según el id
-    ruta_original = rutas.get(ruta_id)
-    if not ruta_original:
+    ruta_id = request.json.get('ruta')
+
+    if ruta_id not in rutas:
         return jsonify({"error": "Ruta no válida"}), 400
 
-    # Identificar tramos bloqueados en la ruta original
-    tramos_cortados = [tr for tr in ruta_original if tr in tramos_bloqueados]
-    
-    # Si hay bloqueos, se genera una ruta alternativa
-    if tramos_cortados:
-        ruta_final = []
-        for tramo in ruta_original:
-            if tramo in tramos_bloqueados:
-                alternativas = [t for t in tramos if t != tramo and t not in tramos_bloqueados]
-                tramo_alternativo = random.choice(alternativas) if alternativas else tramo
-                ruta_final.append(tramo_alternativo)
+    ruta_asignada = rutas[ruta_id]  # La ruta ya está corregida
+    camiones_rutas[id_camion] = ruta_asignada
+
+    return jsonify({"ruta_asignada": ruta_asignada})
+
+
+@app.route('/stream/<int:id_camion>')
+def stream(id_camion):
+    """Establece la conexión SSE con un camión."""
+    def event_stream():
+        while True:
+            if id_camion in conexiones_sse and conexiones_sse[id_camion]:
+                evento = conexiones_sse[id_camion].pop(0)
+                yield f"data: {evento}\n\n"
             else:
-                ruta_final.append(tramo)
-        # Buscar si la ruta alternativa ya está registrada
-        id_nueva_ruta = None
-        for key, valor in rutas.items():
-            if valor == ruta_final:
-                id_nueva_ruta = key
-                break
-        # Si no existe, la añadimos al diccionario de rutas
-        if id_nueva_ruta is None:
-            id_nueva_ruta = max(rutas.keys()) + 1
-            rutas[id_nueva_ruta] = ruta_final
-        ruta_final_id = id_nueva_ruta
-    else:
-        ruta_final = ruta_original
-        ruta_final_id = ruta_id
+                yield "data: ping\n\n"
+            gevent.sleep(3)
 
-    # Actualizar la ruta actual del camión en el diccionario camiones_rutas
-    camiones_rutas[id_camion] = ruta_final_id
+    conexiones_sse[id_camion] = []
+    return Response(event_stream(), content_type="text/event-stream")
 
-    # Registrar al camión en cada tramo de la nueva ruta para futuras notificaciones
-    for tramo in ruta_final:
-        if tramo not in camiones_en_tramos:
-            camiones_en_tramos[tramo] = []
-        if id_camion not in camiones_en_tramos[tramo]:
-            camiones_en_tramos[tramo].append(id_camion)
-    
-    return jsonify({
-        "tramos_cortados": tramos_cortados,
-        "ruta_alternativa": ruta_final
-    })
 
 @app.route('/actualizar_bloqueos', methods=['POST'])
 def actualizar_bloqueos():
+    """Bloquea un tramo y modifica las rutas activas para evitarlo."""
     tramo = request.json.get('tramo')
-    
-    # Agregar el tramo bloqueado, si aún no está en la lista
-    if tramo not in tramos_bloqueados:
-        tramos_bloqueados.append(tramo)
-    
-    # Notificar a cada camión que tenga ese tramo en su ruta
-    if tramo in camiones_en_tramos:
-        for id_camion in camiones_en_tramos[tramo]:
-            # Recuperar la ruta actual del camión (puede ser la original o la ruta alternativa registrada)
-            ruta_actual = camiones_rutas.get(id_camion)
-            if ruta_actual is not None:
-                url = f'http://{HOST_camiones}:{id_camion}/enviar_ruta'
-                # Se envía la ruta actual usando la clave 'ruta'
-                requests.post(url, json={'ruta': ruta_actual})
-    
-    info_ruta = {
-        'tramo': tramo,
-        'estado': 'Corte de carretera',
-    }
-    return jsonify(info_ruta)
+    if tramo not in tramos:
+        return jsonify({"error": "Tramo no válido"}), 400
 
-def mostrar_rutas():
-    print("Rutas disponibles:")
-    for ruta_id, tramos_ruta in rutas.items():
-        print(f"Ruta {ruta_id}: {', '.join(tramos_ruta)}")
+    tramos_bloqueados.add(tramo)
+
+    # 🔹 Hacemos una copia de las claves antes de iterar
+    rutas_a_corregir = list(rutas.keys())
+
+    for ruta_id in rutas_a_corregir:
+        ruta = rutas[ruta_id]
+        if tramo in ruta:
+            # Guardamos la versión original antes de modificarla
+            if ruta_id not in rutas_originales:
+                rutas_originales[ruta_id] = ruta.copy()
+
+            nueva_ruta = calcular_ruta_alternativa(ruta)
+            if nueva_ruta:
+                rutas[ruta_id] = nueva_ruta  # 🔹 Modificamos la ruta directamente
+
+    # Notificar a los camiones en SSE
+    for id_camion, ruta in camiones_rutas.items():
+        if any(t in tramos_bloqueados for t in ruta) and id_camion in conexiones_sse:
+            conexiones_sse[id_camion].append(f"🚧 Corte en {tramo}. Nueva ruta asignada: {', '.join(rutas[ruta_id])}")
+
+    return jsonify({"tramo": tramo, "estado": "Corte registrado"})
+
+
+@app.route('/reabrir_tramo', methods=['POST'])
+def reabrir_tramo():
+    """Reabre un tramo bloqueado y restaura las rutas originales si estaban afectadas."""
+    tramo = request.json.get('tramo')
+    if tramo in tramos_bloqueados:
+        tramos_bloqueados.remove(tramo)
+
+        # Restauramos las rutas originales si el tramo ya no está bloqueado
+        for ruta_id in list(rutas_originales.keys()):
+            rutas[ruta_id] = rutas_originales.pop(ruta_id)  # 🔹 Restauramos la ruta original
+
+    return jsonify({"tramo": tramo, "estado": "Tramo reabierto"})
+
 
 if __name__ == '__main__':
-    mostrar_rutas()
-    app.run(host=HOST_empresa, port=PORT_empresa)
-
+    print(f"🚀 Servidor SSE iniciado en http://{HOST_EMPRESA}:{PORT_EMPRESA}")
+    http_server = WSGIServer((HOST_EMPRESA, PORT_EMPRESA), app)
+    http_server.serve_forever()
