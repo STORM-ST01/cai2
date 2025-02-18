@@ -5,6 +5,8 @@ import threading
 HOST = '127.0.0.1'
 PORT = 8080
 
+lock = threading.Lock()
+
 kms = {"kms totales": 0}
 
 # Función para manejar las conexiones de los clientes
@@ -25,9 +27,12 @@ def handle_client(client_socket, address):
         if km > 16000:
             print(f"Error: el mensaje excede el límite de kilómetros: {km}")
             return
+        elif km < 0:
+            print(f"Error: el mensaje es un número negativo: {km}")
         else:
-            kms["kms totales"] += km
-            print(f"Actualización de kilómetros {kms["kms totales"]} km")
+            with lock:
+                kms["kms totales"] += km
+            print(f"Actualización de kilómetros {kms['kms totales']} km")
     except ValueError:
         print(f"Error: el mensaje no es un número: {mensaje}")
         return
