@@ -27,7 +27,7 @@ def simular_actualizacion_camionero(camionero_id):
         print(f"Error en la conexión con el servidor: {e}")
 
 # Iniciar múltiples clientes para simular varios camioneros
-for i in [1, 2]:  # Ajusta el número según lo necesites
+for i in [0, 1]:  # Ajusta el número según lo necesites
     for j in range (0, 3999):
         cliente_thread = threading.Thread(target=simular_actualizacion_camionero, args=(i*4+j,))
         cliente_thread.start()
